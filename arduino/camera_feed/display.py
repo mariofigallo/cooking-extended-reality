@@ -4,7 +4,7 @@ import cv2
 import struct
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-PORT = '/dev/cu.usbserial-210'       # Windows: e.g. COM5  |  Linux/Mac: e.g. /dev/ttyUSB0
+PORT = '/dev/cu.usbserial-10'       # Windows: e.g. COM5  |  Linux/Mac: e.g. /dev/ttyUSB0
 BAUD = 460800   
 # ──────────────────────────────────────────────────────────────────────────────
 
