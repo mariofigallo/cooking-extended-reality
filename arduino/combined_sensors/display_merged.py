@@ -1,8 +1,12 @@
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 import serial
 import struct
 import numpy as np
 import cv2
 from ultralytics import YOLO
+from thermal_services import get_temp_for_object
 
 # ── Configuration ────────────────────────────────────────────────────────────
 PORT = '/dev/cu.usbserial-10'
@@ -29,18 +33,47 @@ def colour_for(class_id: int):
     return PALETTE[class_id % len(PALETTE)]
 
 
-def draw_detections(frame, results):
-    """Draw bounding boxes + labels from a YOLO Results object onto frame."""
+def get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2, cam_w=320, cam_h=240):
+    """Map a bounding box from camera space to the 32x24 thermal grid and return the avg temp."""
+    if thermal_grid is None:
+        return None
+    th, tw = thermal_grid.shape  # 24, 32
+
+    # Scale camera coords to thermal grid coords
+    tx1 = max(0, int(x1 * tw / cam_w))
+    ty1 = max(0, int(y1 * th / cam_h))
+    tx2 = min(tw, int(x2 * tw / cam_w))
+    ty2 = min(th, int(y2 * th / cam_h))
+
+    if tx2 <= tx1 or ty2 <= ty1:
+        return None
+
+    region = thermal_grid[ty1:ty2, tx1:tx2]
+    return float(np.mean(region))
+
+
+def draw_detections(frame, results, thermal_grid=None):
+    """Draw bounding boxes + labels with corrected temperature from thermal data."""
     boxes = results[0].boxes
     names = results[0].names
 
     for box in boxes:
         cls_id = int(box.cls[0])
         conf   = float(box.conf[0])
-        label  = f"{names[cls_id]} {conf:.2f}"
+        class_name = names[cls_id]
         colour = colour_for(cls_id)
 
         x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        # Get corrected temperature for this object
+        raw_temp = get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2)
+        if raw_temp is not None:
+            result = get_temp_for_object(class_name, raw_temp)
+            temp_str = f" {result['true_temp_c']}C"
+        else:
+            temp_str = ""
+
+        label = f"{class_name} {conf:.2f}{temp_str}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
 
@@ -117,6 +150,7 @@ def main():
 
     last_camera = np.zeros((240, 320, 3), dtype=np.uint8)
     last_thermal = np.zeros((240, 320, 3), dtype=np.uint8)
+    last_thermal_grid = None  # raw 24x32 temperature array (flipped)
     t_min, t_max = 0.0, 0.0
     frame_count = 0
     last_results = None
@@ -141,11 +175,12 @@ def main():
                 last_results = model(frame, conf=YOLO_CONF, verbose=False)
 
             if last_results is not None:
-                frame = draw_detections(frame, last_results)
+                frame = draw_detections(frame, last_results, last_thermal_grid)
 
             last_camera = frame
 
         elif ptype == 'thermal':
+            last_thermal_grid = np.fliplr(data)  # keep raw temps for temperature lookup
             last_thermal, t_min, t_max = thermal_to_colormap(data)
 
         # Side by side: camera+YOLO on left, thermal heatmap on right
