@@ -39,7 +39,7 @@ const uint8_t CAM_MAGIC[]   = {0xFF, 0xAA, 0xBB, 0xCC};
 const uint8_t THERM_MAGIC[] = {0xFF, 0xDD, 0xEE, 0x11};
 
 void setup() {
-  Serial.begin(460800);
+  Serial.begin(600000);
 
   // ── Camera init ───────────────────────────────────────────────────────────
   camera_config_t config;

@@ -9,8 +9,8 @@ from ultralytics import YOLO
 from thermal_services import get_temp_for_object
 
 # ── Configuration ────────────────────────────────────────────────────────────
-PORT = '/dev/cu.usbserial-10'
-BAUD = 460800
+PORT = '/dev/cu.usbserial-1140'
+BAUD = 600000
 YOLO_CONF = 0.4          # Minimum confidence threshold (0-1)
 YOLO_EVERY_N = 2         # Run YOLO on every Nth camera frame (1 = every frame)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,35 +52,36 @@ def get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2, cam_w=320, cam_h=240):
     return float(np.mean(region))
 
 
-def draw_detections(frame, results, thermal_grid=None):
-    """Draw bounding boxes + labels with corrected temperature from thermal data."""
-    boxes = results[0].boxes
-    names = results[0].names
+def draw_detections(frame, results_list, thermal_grid=None):
+    """Draw bounding boxes + labels from one or more YOLO Results onto frame."""
+    for results in results_list:
+        boxes = results[0].boxes
+        names = results[0].names
 
-    for box in boxes:
-        cls_id = int(box.cls[0])
-        conf   = float(box.conf[0])
-        class_name = names[cls_id]
-        colour = colour_for(cls_id)
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            conf   = float(box.conf[0])
+            class_name = names[cls_id]
+            colour = colour_for(cls_id)
 
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-        # Get corrected temperature for this object
-        raw_temp = get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2)
-        if raw_temp is not None:
-            result = get_temp_for_object(class_name, raw_temp)
-            temp_str = f" {result['true_temp_c']}C"
-        else:
-            temp_str = ""
+            # Get corrected temperature for this object
+            raw_temp = get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2)
+            if raw_temp is not None:
+                result = get_temp_for_object(class_name, raw_temp)
+                temp_str = f" {result['true_temp_c']}C"
+            else:
+                temp_str = ""
 
-        label = f"{class_name} {conf:.2f}{temp_str}"
+            label = f"{class_name} {conf:.2f}{temp_str}"
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
 
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(frame, (x1, y1 - th - baseline - 4), (x1 + tw + 2, y1), colour, -1)
-        cv2.putText(frame, label, (x1 + 1, y1 - baseline - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(frame, (x1, y1 - th - baseline - 4), (x1 + tw + 2, y1), colour, -1)
+            cv2.putText(frame, label, (x1 + 1, y1 - baseline - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
     return frame
 
@@ -135,9 +136,10 @@ def thermal_to_colormap(temps):
 
 
 def main():
-    print("Loading YOLO11m model ...")
-    model = YOLO("yolo11m.pt")
-    print("Model ready.")
+    print("Loading models ...")
+    model_base = YOLO("yolo11m.pt")                                          # 80 COCO classes
+    model_custom = YOLO("../../runs/detect/pancake_pan2/weights/best.pt")     # pan + pancake
+    print("Both models ready.")
 
     print(f"Opening {PORT} at {BAUD} baud ...")
     try:
@@ -153,7 +155,7 @@ def main():
     last_thermal_grid = None  # raw 24x32 temperature array (flipped)
     t_min, t_max = 0.0, 0.0
     frame_count = 0
-    last_results = None
+    last_results_list = []
 
     while True:
         packet = read_next_packet(ser)
@@ -170,12 +172,15 @@ def main():
             frame = cv2.resize(frame, (320, 240))
             frame_count += 1
 
-            # Run YOLO every N camera frames
+            # Run both models every N camera frames
             if frame_count % YOLO_EVERY_N == 0:
-                last_results = model(frame, conf=YOLO_CONF, verbose=False)
+                last_results_list = [
+                    model_base(frame, conf=YOLO_CONF, verbose=False),
+                    model_custom(frame, conf=YOLO_CONF, verbose=False),
+                ]
 
-            if last_results is not None:
-                frame = draw_detections(frame, last_results, last_thermal_grid)
+            if last_results_list:
+                frame = draw_detections(frame, last_results_list, last_thermal_grid)
 
             last_camera = frame
 
