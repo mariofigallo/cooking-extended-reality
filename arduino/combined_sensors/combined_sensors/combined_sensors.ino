@@ -64,8 +64,8 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_QVGA;  // 320x240
-  config.jpeg_quality = 20;
-  config.fb_count     = 1;
+  config.jpeg_quality = 30;               // more compression = smaller file = faster transfer
+  config.fb_count     = 2;               // double buffer: capture next while sending current
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -117,7 +117,7 @@ void loop() {
   Serial.write(THERM_MAGIC, 4);
   Serial.write((uint8_t*)tempValues, sizeof(tempValues));  // always 3072 bytes
 
-  delay(100);
+  delay(10);
 }
 
 void readTempValues() {
