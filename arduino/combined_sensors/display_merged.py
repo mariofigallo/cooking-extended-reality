@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 from ultralytics import YOLO
 from thermal_services import get_temp_for_object
+from homography import HomographyCalibrator
  
 # ── Configuration ────────────────────────────────────────────────────────────
 PORT = '/dev/cu.usbserial-2140'
@@ -58,22 +59,30 @@ def get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2, cam_w=240, cam_h=320):
     return float(np.mean(region))
  
  
-def draw_detections(frame, results_list, thermal_grid=None):
+def draw_detections(frame, results_list, thermal_grid=None, calibrator=None):
     """Draw bounding boxes + detection list at bottom-left."""
+    # Pre-warp thermal if calibrator is ready
+    warped_thermal = calibrator.warp_thermal(thermal_grid) \
+        if calibrator and calibrator.calibrated and thermal_grid is not None else None
+
     detections = []
     for results in results_list:
         boxes = results[0].boxes
         names = results[0].names
- 
+
         for box in boxes:
             cls_id = int(box.cls[0])
             conf   = float(box.conf[0])
             class_name = names[cls_id]
             colour = colour_for(cls_id)
- 
+
             x1, y1, x2, y2 = map(int, box.xyxy[0])
- 
-            raw_temp = get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2)
+
+            # Use homography-warped thermal if calibrated, else naive fallback
+            if warped_thermal is not None:
+                raw_temp = calibrator.get_temp_for_box(warped_thermal, x1, y1, x2, y2)
+            else:
+                raw_temp = get_raw_temp_for_box(thermal_grid, x1, y1, x2, y2)
             if raw_temp is not None:
                 result = get_temp_for_object(class_name, raw_temp)
                 temp_str = f" {result['true_temp_c']}C"
@@ -176,6 +185,15 @@ def main():
     t_min, t_max = 0.0, 0.0
     frame_count = 0
     last_results_list = []
+
+    # ── Homography calibrator ───────────────────────────────────────────
+    calib_path = os.path.join(os.path.dirname(__file__), '..', '..', 'homography', 'calibration.json')
+    calibrator = HomographyCalibrator(thermal_shape=(24, 32), rgb_shape=(320, 240))
+    if os.path.exists(calib_path):
+        calibrator.load(calib_path)
+        print(f"Loaded previous calibration: {calibrator.status_text}")
+    else:
+        print("No saved calibration — will auto-calibrate from detections.")
  
     while True:
         packet = read_next_packet(ser)
@@ -199,9 +217,18 @@ def main():
                 last_results_list = [model_custom(frame, conf=YOLO_CONF, verbose=False)]
                 if model_base is not None:
                     last_results_list.append(model_base(frame, conf=YOLO_CONF, verbose=False))
- 
+
+            # ── Homography: collect correspondences from custom model detections ──
+            if last_thermal_grid is not None and last_results_list and not calibrator.calibrated:
+                custom_boxes = last_results_list[0][0].boxes
+                if len(custom_boxes) > 0:
+                    best_idx = int(custom_boxes.conf.argmax())
+                    bbox = tuple(map(int, custom_boxes.xyxy[best_idx]))
+                    if calibrator.add_correspondence(last_thermal_grid, bbox):
+                        print(f"[calib] {calibrator.status_text}")
+
             if last_results_list:
-                frame = draw_detections(frame, last_results_list, last_thermal_grid)
+                frame = draw_detections(frame, last_results_list, last_thermal_grid, calibrator)
  
             last_camera = frame
  
@@ -217,9 +244,11 @@ def main():
         # Side by side: camera+YOLO on left (240x320), thermal heatmap on right (320x320)
         combined = np.hstack((last_camera, thermal_display))
  
-        # Frame counter on camera side
+        # Frame counter + calibration status on camera side
         cv2.putText(combined, f"frame {frame_count}", (6, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(combined, calibrator.status_text, (6, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
  
         # Temperature range on thermal side
         label = f"{t_min:.1f}C - {t_max:.1f}C"
@@ -231,7 +260,11 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("Quitting.")
             break
- 
+
+    # Save calibration for next run
+    if calibrator.num_points > 0:
+        calibrator.save(calib_path)
+
     ser.close()
     cv2.destroyAllWindows()
  

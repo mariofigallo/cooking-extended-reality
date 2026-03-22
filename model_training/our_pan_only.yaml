@@ -1,0 +1,6 @@
+path: /Users/mariofigallo/Documents/UofT/Semester 8/ECE516/cooking-extended-reality/datasets/our_pan_labeled
+train: images
+val: images
+
+nc: 2
+names: ['pan', 'pancake']

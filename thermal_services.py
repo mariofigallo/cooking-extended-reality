@@ -57,7 +57,7 @@ def estimate_temp(raw_temp_c: float, emissivity: float, ambient_temp_c: float = 
     """
     if not (0.01 <= emissivity <= 1.0):
         raise ValueError(f"Emissivity must be 0.01–1.0, got {emissivity}")
-
+       
     T_raw = raw_temp_c     + 273.15
     T_amb = ambient_temp_c + 273.15
 

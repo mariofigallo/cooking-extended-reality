@@ -1,3 +1,6 @@
 /.venv
 yolov8n.pt
 yolov8s.pt
+yolo11m.pt
+/resources
+/datasets
