@@ -23,7 +23,8 @@ MATERIAL_TABLE = {
     # ... add your entries here
 
     "default": {"emissivity": 0.90, "convective_coeff": 8.0, "notes": "generic non-metallic surface"},
-    "stainless steel pan": {"emissivity": 0.25, "convective_coeff": 0.19, "notes": "need to update empirically"}
+    "stainless steel pan": {"emissivity": 0.25, "convective_coeff": 0.19, "notes": "need to update empirically"},
+    "pan": {"emissivity": 0.95, "convective_coeff": 8.0, "notes": "granite coated non-stick pan"}
 }
 
 

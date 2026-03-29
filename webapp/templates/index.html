@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CookingXR</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f0f4f8;
+            color: #1e293b;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: #fff;
+            text-align: center;
+            padding: 14px 0 10px;
+            border-bottom: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+
+        .header h1 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #1e40af;
+        }
+
+        .header .subtitle {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 2px;
+        }
+
+        /* ── Two-column layout: video left, info right ── */
+        .main {
+            max-width: 1200px;
+            margin: 16px auto;
+            padding: 0 16px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            align-items: start;
+        }
+
+        .left-col {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .right-col {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        /* ── State Banner ────────────────────────────────── */
+        .state-banner {
+            text-align: center;
+            padding: 10px 16px;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 700;
+            letter-spacing: 1px;
+            transition: all 0.3s ease;
+        }
+
+        .state-WAITING  { background: #e2e8f0; color: #94a3b8; }
+        .state-SIDE1    { background: linear-gradient(135deg, #fef3c7, #fde68a); color: #b45309; }
+        .state-FLIP     { background: linear-gradient(135deg, #fed7aa, #fdba74); color: #c2410c; animation: pulse 0.8s ease-in-out infinite alternate; }
+        .state-SIDE2    { background: linear-gradient(135deg, #dbeafe, #bfdbfe); color: #1d4ed8; }
+        .state-DONE     { background: linear-gradient(135deg, #d1fae5, #a7f3d0); color: #047857; animation: pulse 1.2s ease-in-out infinite alternate; }
+
+        @keyframes pulse {
+            from { opacity: 0.85; transform: scale(1); }
+            to   { opacity: 1; transform: scale(1.01); }
+        }
+
+        /* ── Video Feed ──────────────────────────────────── */
+        .feed-card {
+            background: #fff;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        }
+
+        .feed-header {
+            padding: 8px 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .feed-header .label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #94a3b8;
+        }
+
+        .toggle-overlay {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #94a3b8;
+            user-select: none;
+        }
+
+        .toggle-overlay input { display: none; }
+
+        .toggle-switch {
+            width: 36px;
+            height: 20px;
+            background: #cbd5e1;
+            border-radius: 10px;
+            position: relative;
+            transition: background 0.2s;
+        }
+
+        .toggle-switch::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 16px;
+            height: 16px;
+            background: #fff;
+            border-radius: 50%;
+            transition: all 0.2s;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+        }
+
+        .toggle-overlay input:checked + .toggle-switch {
+            background: #3b82f6;
+        }
+
+        .toggle-overlay input:checked + .toggle-switch::after {
+            left: 18px;
+        }
+
+        .feed-container {
+            position: relative;
+            width: 100%;
+            background: #0f172a;
+        }
+
+        .feed-container img {
+            width: 100%;
+            display: block;
+            aspect-ratio: 4/3;
+            object-fit: contain;
+        }
+
+        #thermalFeed {
+            position: absolute;
+            top: 0;
+            left: 0;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+        }
+
+        #thermalFeed.visible {
+            opacity: 0.25;
+        }
+
+        /* ── Cards ───────────────────────────────────────── */
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        }
+
+        /* ── Temperature Cards ───────────────────────────── */
+        .temps {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .temp-card {
+            text-align: center;
+        }
+
+        .temp-card .temp-label {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #94a3b8;
+            margin-bottom: 4px;
+        }
+
+        .temp-card .temp-value {
+            font-size: 2rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .temp-card .temp-unit {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-left: 2px;
+        }
+
+        .temp-pan .temp-value { color: #ea580c; }
+        .temp-pancake .temp-value { color: #059669; }
+
+        .temp-warning {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 6px;
+            padding: 5px 8px;
+            border-radius: 6px;
+            display: none;
+        }
+
+        .temp-warning.warn-low {
+            display: block;
+            background: #dbeafe;
+            color: #2563eb;
+        }
+
+        .temp-warning.warn-ready {
+            display: block;
+            background: #d1fae5;
+            color: #047857;
+        }
+
+        .temp-warning.warn-high {
+            display: block;
+            background: #fee2e2;
+            color: #dc2626;
+        }
+
+        /* ── Progress Section ────────────────────────────── */
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .progress-header .side-label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #64748b;
+        }
+
+        .progress-header .timer {
+            font-size: 1.6rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            color: #1e293b;
+        }
+
+        .progress-bar-bg {
+            width: 100%;
+            height: 10px;
+            background: #e2e8f0;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            border-radius: 5px;
+            transition: width 0.3s ease, background 0.3s ease;
+            width: 0%;
+        }
+
+        .fill-side1  { background: linear-gradient(90deg, #f97316, #fb923c); }
+        .fill-flip   { background: linear-gradient(90deg, #ef4444, #f87171); }
+        .fill-side2  { background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+        .fill-done   { background: linear-gradient(90deg, #10b981, #34d399); }
+
+        .progress-pct {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 6px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ── Controls ────────────────────────────────────── */
+        .controls {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            letter-spacing: 0.5px;
+        }
+
+        .btn:active { transform: scale(0.97); }
+
+        .btn-flip {
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: white;
+        }
+        .btn-flip:hover { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
+        .btn-flip:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        .btn-reset {
+            background: #e2e8f0;
+            color: #64748b;
+        }
+        .btn-reset:hover { background: #cbd5e1; color: #475569; }
+
+        /* ── Connection status ───────────────────────────── */
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            background: #22c55e;
+            animation: blink 2s ease-in-out infinite;
+        }
+
+        .status-dot.disconnected {
+            background: #ef4444;
+            animation: none;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* ── Responsive ──────────────────────────────────── */
+        @media (max-width: 800px) {
+            .main { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>CookingXR</h1>
+        <div class="subtitle"><span class="status-dot" id="statusDot"></span>Thermal-guided cooking assistant</div>
+    </div>
+
+    <div class="main">
+        <!-- Left: Video + State -->
+        <div class="left-col">
+            <div class="state-banner state-WAITING" id="stateBanner">WAITING</div>
+
+            <div class="feed-card">
+                <div class="feed-header">
+                    <span class="label">Camera</span>
+                    <label class="toggle-overlay">
+                        Thermal
+                        <input type="checkbox" id="overlayToggle">
+                        <span class="toggle-switch"></span>
+                    </label>
+                </div>
+                <div class="feed-container">
+                    <img id="rgbFeed" src="" alt="Camera Feed">
+                    <img id="thermalFeed" src="" alt="Thermal Overlay">
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Temps + Progress + Controls -->
+        <div class="right-col">
+            <div class="card temps">
+                <div class="temp-card temp-pan">
+                    <div class="temp-label">Pan Temp</div>
+                    <div class="temp-value" id="panTemp">--<span class="temp-unit">°C</span></div>
+                    <div class="temp-warning" id="panWarning"></div>
+                </div>
+                <div class="temp-card temp-pancake">
+                    <div class="temp-label">Pancake Temp</div>
+                    <div class="temp-value" id="pancakeTemp">--<span class="temp-unit">°C</span></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="progress-header">
+                    <span class="side-label" id="sideLabel">--</span>
+                    <span class="timer" id="timer">--:--</span>
+                </div>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill fill-side1" id="progressFill"></div>
+                </div>
+                <div class="progress-pct" id="progressPct">0%</div>
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-flip" id="btnFlip" disabled onclick="sendFlip()">Flip Pancake</button>
+                <button class="btn btn-reset" onclick="sendReset()">Reset</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        const statusDot = document.getElementById('statusDot');
+        const overlayToggle = document.getElementById('overlayToggle');
+        const thermalFeed = document.getElementById('thermalFeed');
+
+        overlayToggle.addEventListener('change', () => {
+            thermalFeed.classList.toggle('visible', overlayToggle.checked);
+        });
+
+        socket.on('connect', () => { statusDot.classList.remove('disconnected'); });
+        socket.on('disconnect', () => { statusDot.classList.add('disconnected'); });
+
+        socket.on('update', (data) => {
+            if (data.rgb_frame) {
+                document.getElementById('rgbFeed').src = 'data:image/jpeg;base64,' + data.rgb_frame;
+            }
+            if (data.thermal_frame) {
+                thermalFeed.src = 'data:image/jpeg;base64,' + data.thermal_frame;
+            }
+
+            const banner = document.getElementById('stateBanner');
+            const st = data.cook_state;
+            banner.textContent = st;
+            banner.className = 'state-banner';
+            if (st === 'WAITING')      banner.classList.add('state-WAITING');
+            else if (st === 'SIDE 1')  banner.classList.add('state-SIDE1');
+            else if (st === 'FLIP')    banner.classList.add('state-FLIP');
+            else if (st === 'SIDE 2')  banner.classList.add('state-SIDE2');
+            else if (st === 'DONE')    banner.classList.add('state-DONE');
+
+            const panEl = document.getElementById('panTemp');
+            const pcEl = document.getElementById('pancakeTemp');
+            panEl.innerHTML = data.smoothed_pan !== null
+                ? data.smoothed_pan + '<span class="temp-unit">°C</span>'
+                : '--<span class="temp-unit">°C</span>';
+            pcEl.innerHTML = data.smoothed_pancake !== null
+                ? data.smoothed_pancake + '<span class="temp-unit">°C</span>'
+                : '--<span class="temp-unit">°C</span>';
+
+            const panWarn = document.getElementById('panWarning');
+            panWarn.className = 'temp-warning';
+            panWarn.textContent = '';
+            if (data.smoothed_pan !== null && data.smoothed_pan > 0) {
+                if (data.smoothed_pan < 170) {
+                    panWarn.classList.add('warn-low');
+                    panWarn.textContent = 'Pan temp too low';
+                } else if (data.smoothed_pan <= 210) {
+                    panWarn.classList.add('warn-ready');
+                    panWarn.textContent = 'Ready to cook! Please add batter';
+                } else {
+                    panWarn.classList.add('warn-high');
+                    panWarn.textContent = 'Pan temp too high';
+                }
+            }
+
+            const fill = document.getElementById('progressFill');
+            fill.style.width = data.progress + '%';
+            fill.className = 'progress-bar-fill';
+            if (st === 'SIDE 1')      fill.classList.add('fill-side1');
+            else if (st === 'FLIP')   fill.classList.add('fill-flip');
+            else if (st === 'SIDE 2') fill.classList.add('fill-side2');
+            else if (st === 'DONE')   fill.classList.add('fill-done');
+
+            document.getElementById('progressPct').textContent = Math.round(data.progress) + '%';
+            document.getElementById('timer').textContent = data.elapsed;
+
+            const sideLabel = document.getElementById('sideLabel');
+            if (st === 'SIDE 1')      sideLabel.textContent = 'Side 1 — ' + data.target_side1 + 's target';
+            else if (st === 'FLIP')   sideLabel.textContent = 'Flip now!';
+            else if (st === 'SIDE 2') sideLabel.textContent = 'Side 2 — ' + data.target_side2 + 's target';
+            else if (st === 'DONE')   sideLabel.textContent = 'Total: ' + data.total_elapsed;
+            else                       sideLabel.textContent = 'Waiting for pancake...';
+
+            document.getElementById('btnFlip').disabled = (st !== 'FLIP');
+
+            handleAudioAlert(st);
+        });
+
+        // ── Audio alerts ──────────────────────────────────
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let alertInterval = null;
+        let lastAlertState = null;
+
+        function playTone(freq, duration, type = 'sine') {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function playFlipAlert() {
+            playTone(880, 0.15);
+            setTimeout(() => playTone(880, 0.15), 200);
+        }
+
+        function playDoneChime() {
+            playTone(523, 0.2);
+            setTimeout(() => playTone(659, 0.2), 150);
+            setTimeout(() => playTone(784, 0.3), 300);
+        }
+
+        function handleAudioAlert(st) {
+            if (st === lastAlertState) return;
+            // Clear any existing repeating alert
+            if (alertInterval) { clearInterval(alertInterval); alertInterval = null; }
+
+            if (st === 'FLIP') {
+                audioCtx.resume();
+                playFlipAlert();
+                alertInterval = setInterval(playFlipAlert, 2000);
+            } else if (st === 'DONE') {
+                audioCtx.resume();
+                playDoneChime();
+            }
+            lastAlertState = st;
+        }
+
+        function sendFlip() { socket.emit('flip'); }
+        function sendReset() { socket.emit('reset'); }
+    </script>
+</body>
+</html>

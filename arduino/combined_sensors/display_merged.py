@@ -188,7 +188,8 @@ def main():
 
     # ── Homography calibrator ───────────────────────────────────────────
     calib_path = os.path.join(os.path.dirname(__file__), '..', '..', 'homography', 'calibration.json')
-    calibrator = HomographyCalibrator(thermal_shape=(24, 32), rgb_shape=(320, 240))
+    # After 90° CW rotation: numpy shape is (240, 320) = (rows, cols)
+    calibrator = HomographyCalibrator(thermal_shape=(24, 32), rgb_shape=(240, 320))
     if os.path.exists(calib_path):
         calibrator.load(calib_path)
         print(f"Loaded previous calibration: {calibrator.status_text}")

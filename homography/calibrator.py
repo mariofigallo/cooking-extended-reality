@@ -5,14 +5,12 @@ Online self-calibration for aligning an MLX90640 thermal sensor (32×24)
 to an ESP32-CAM RGB stream.
 
 Strategy:
-  1. Each frame, YOLO detects a hot object (e.g. pan) → bbox center in RGB space.
-  2. The thermal hotspot centroid is found in thermal space.
-  3. The (thermal_pt → rgb_pt) correspondence is stored if it's spatially
-     diverse enough from existing points.
-  4. Once ≥ MIN_POINTS diverse correspondences exist, cv2.findHomography
-     with RANSAC computes H mapping thermal → RGB.
-  5. After calibration, warp_thermal() projects the full thermal grid into
-     RGB pixel space so temperature queries use aligned coordinates.
+  1. Fit an ellipse to the hot pan contour in thermal space → center + size.
+  2. YOLO detects the pan in RGB → bounding box → center + size.
+  3. Compute a 2D affine transform: translate + rotate + scale.
+     Rotation is a fixed offset (configured once for the mount), not
+     derived from the ellipse angle (which is ambiguous for circular pans).
+  4. Accumulate transforms across frames and median-average for stability.
 """
 
 import json
@@ -22,123 +20,153 @@ from pathlib import Path
 
 
 class HomographyCalibrator:
-    # Minimum correspondences before solving
-    MIN_POINTS = 8
-    # New point must be at least this far (in thermal pixels) from all existing points
-    MIN_DIST_THERMAL = 3.0
-    # And this far in RGB pixels
-    MIN_DIST_RGB = 20.0
+    MIN_FRAMES = 3
 
-    def __init__(self, thermal_shape=(24, 32), rgb_shape=(240, 320)):
+    def __init__(self, thermal_shape=(24, 32), rgb_shape=(240, 320),
+                 rotation_deg=0.0, scale_factor=1.0):
         """
         Parameters
         ----------
-        thermal_shape : (rows, cols) of the thermal grid — (24, 32) for MLX90640
-        rgb_shape     : (rows, cols) of the RGB frame the YOLO model runs on
+        thermal_shape  : (rows, cols) of the thermal grid
+        rgb_shape      : (rows, cols) of the RGB frame
+        rotation_deg   : fixed rotation offset in degrees from thermal → RGB
+                         (positive = counter-clockwise). Tune this once for
+                         your physical mount.
+        scale_factor   : multiplier on the computed scale (< 1.0 shrinks the
+                         warped thermal, > 1.0 enlarges it). Use to compensate
+                         for YOLO bbox being larger than the actual pan.
         """
         self.thermal_shape = thermal_shape
         self.rgb_shape = rgb_shape
+        self.rotation_deg = rotation_deg
+        self.scale_factor = scale_factor
 
-        # Accumulated correspondences: lists of [x, y] in each space
-        self.pts_thermal = []   # source points (thermal pixel coords)
-        self.pts_rgb = []       # destination points (RGB pixel coords)
-
-        # 3×3 homography matrix (thermal → RGB), None until calibrated
+        self._affine_samples = []
         self.H = None
         self.calibrated = False
 
-    # ── Correspondence collection ───────────────────────────────────────────
+        # For visualization
+        self.pts_thermal = []
+        self.pts_rgb = []
 
-    def _is_diverse(self, thermal_pt, rgb_pt):
-        """Return True if the new point is far enough from all existing ones."""
-        if len(self.pts_thermal) == 0:
-            return True
-        t_arr = np.array(self.pts_thermal)
-        r_arr = np.array(self.pts_rgb)
-        t_dists = np.linalg.norm(t_arr - thermal_pt, axis=1)
-        r_dists = np.linalg.norm(r_arr - rgb_pt, axis=1)
-        return float(t_dists.min()) >= self.MIN_DIST_THERMAL and \
-               float(r_dists.min()) >= self.MIN_DIST_RGB
+    # ── Ellipse fitting ───────────────────────────────────────────────────
 
-    def thermal_hotspot_centroid(self, thermal_grid, top_k=5):
+    def _find_thermal_ellipse(self, thermal_grid):
+        """Find the hot pan contour and fit an ellipse. Returns ellipse or None."""
+        t_min, t_max = float(thermal_grid.min()), float(thermal_grid.max())
+        if t_max - t_min < 2.0:
+            return None
+
+        thresh = t_min + 0.6 * (t_max - t_min)
+        mask = (thermal_grid >= thresh).astype(np.uint8) * 255
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 5 or len(largest) < 5:
+            return None
+
+        return cv2.fitEllipse(largest)
+
+    # ── Affine computation ────────────────────────────────────────────────
+
+    def _compute_affine(self, thermal_ellipse, bbox_xyxy):
         """
-        Find the centroid of the hottest region in the thermal grid.
+        Compute a 2×3 affine mapping thermal coords → RGB coords.
 
-        Uses the top_k hottest pixels and averages their coordinates to get a
-        sub-pixel centroid that is more stable than a single argmax.
-
-        Returns (x, y) in thermal pixel coordinates.
+        Uses the thermal ellipse center/size, YOLO bbox center/size,
+        and the fixed rotation_deg offset.
         """
-        flat = thermal_grid.flatten()
-        # Indices of top_k hottest pixels
-        top_indices = flat.argsort()[-top_k:]
-        rows, cols = np.unravel_index(top_indices, thermal_grid.shape)
-        # Weight by temperature so hotter pixels pull the centroid more
-        weights = flat[top_indices]
-        weights = weights - weights.min() + 1e-6  # shift so all positive
-        cx = float(np.average(cols, weights=weights))
-        cy = float(np.average(rows, weights=weights))
-        return np.array([cx, cy])
+        (tcx, tcy), (tw, th), _ = thermal_ellipse
+        # Use the average radius (pan is circular)
+        t_radius = max((tw + th) / 4.0, 0.1)
 
-    def bbox_center(self, x1, y1, x2, y2):
-        """Return center of a bounding box as [x, y]."""
-        return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+        x1, y1, x2, y2 = bbox_xyxy
+        rcx = (x1 + x2) / 2.0
+        rcy = (y1 + y2) / 2.0
+        # Use average of bbox half-dims as RGB radius
+        r_radius = max(((x2 - x1) + (y2 - y1)) / 4.0, 0.1)
+
+        scale = (r_radius / t_radius) * self.scale_factor
+
+        rad = np.deg2rad(self.rotation_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+
+        # M = T_rgb @ S @ R @ T_thermal_inv
+        T1 = np.array([[1, 0, -tcx],
+                        [0, 1, -tcy],
+                        [0, 0,    1]], dtype=np.float64)
+
+        R = np.array([[cos_a, -sin_a, 0],
+                       [sin_a,  cos_a, 0],
+                       [    0,      0, 1]], dtype=np.float64)
+
+        S = np.array([[scale, 0, 0],
+                       [0, scale, 0],
+                       [0,     0, 1]], dtype=np.float64)
+
+        T2 = np.array([[1, 0, rcx],
+                        [0, 1, rcy],
+                        [0, 0,   1]], dtype=np.float64)
+
+        M = T2 @ S @ R @ T1
+        return M[:2, :]
+
+    # ── Correspondence collection ─────────────────────────────────────────
 
     def add_correspondence(self, thermal_grid, bbox_xyxy):
-        """
-        Try to add a new correspondence from the current frame.
-
-        Parameters
-        ----------
-        thermal_grid : np.ndarray (24, 32) — raw temperature array (already
-                       orientation-corrected to match camera view direction)
-        bbox_xyxy    : tuple (x1, y1, x2, y2) — YOLO bounding box of a hot
-                       object in RGB pixel coordinates
-
-        Returns
-        -------
-        added : bool — True if a new point was accepted
-        """
-        thermal_pt = self.thermal_hotspot_centroid(thermal_grid)
-        rgb_pt = self.bbox_center(*bbox_xyxy)
-
-        if not self._is_diverse(thermal_pt, rgb_pt):
+        """Compute affine from current frame and accumulate."""
+        thermal_ellipse = self._find_thermal_ellipse(thermal_grid)
+        if thermal_ellipse is None:
             return False
 
-        self.pts_thermal.append(thermal_pt.tolist())
-        self.pts_rgb.append(rgb_pt.tolist())
+        affine = self._compute_affine(thermal_ellipse, bbox_xyxy)
+        if affine is None:
+            return False
 
-        # Re-solve whenever we have enough points
-        if len(self.pts_thermal) >= self.MIN_POINTS:
+        self._affine_samples.append(affine)
+
+        # Store centers for visualization
+        (tcx, tcy), _, _ = thermal_ellipse
+        x1, y1, x2, y2 = bbox_xyxy
+        self.pts_thermal.append([tcx, tcy])
+        self.pts_rgb.append([(x1+x2)/2.0, (y1+y2)/2.0])
+
+        if len(self._affine_samples) >= self.MIN_FRAMES:
             self._solve()
 
         return True
 
-    # ── Homography computation ──────────────────────────────────────────────
-
     def _solve(self):
-        src = np.array(self.pts_thermal, dtype=np.float64)
-        dst = np.array(self.pts_rgb, dtype=np.float64)
-        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-        if H is not None:
-            self.H = H
-            self.calibrated = True
-            inliers = int(mask.sum()) if mask is not None else len(src)
-            print(f"[HomographyCalibrator] Solved H with {inliers}/{len(src)} inliers "
-                  f"({len(src)} total correspondences)")
+        stacked = np.array(self._affine_samples)
+        avg_affine = np.median(stacked, axis=0)
+        self.H = np.vstack([avg_affine, [0, 0, 1]])
+        self.calibrated = True
+        print(f"[HomographyCalibrator] Calibrated from {len(self._affine_samples)} frames "
+              f"(rotation={self.rotation_deg:.1f}°, scale={self.scale_factor:.2f})")
 
-    # ── Warping ─────────────────────────────────────────────────────────────
+    def recalibrate(self, rotation_deg=None, scale_factor=None):
+        """Update rotation/scale and clear so it re-collects."""
+        if rotation_deg is not None:
+            self.rotation_deg = rotation_deg
+        if scale_factor is not None:
+            self.scale_factor = scale_factor
+        self._affine_samples.clear()
+        self.pts_thermal.clear()
+        self.pts_rgb.clear()
+        self.H = None
+        self.calibrated = False
+
+    # ── Warping ───────────────────────────────────────────────────────────
 
     def warp_thermal(self, thermal_grid):
-        """
-        Warp the 24×32 thermal grid into RGB pixel space.
-
-        Returns an array of shape (rgb_h, rgb_w) where each pixel holds the
-        interpolated temperature value at that RGB location.  Pixels outside
-        the thermal FOV are filled with NaN.
-
-        Returns None if not yet calibrated.
-        """
+        """Warp thermal grid into RGB space. Returns (rgb_h, rgb_w) float array with NaN borders."""
         if not self.calibrated:
             return None
 
@@ -154,19 +182,7 @@ class HomographyCalibrator:
         return warped
 
     def get_temp_for_box(self, warped_thermal, x1, y1, x2, y2):
-        """
-        Query the max temperature inside a bounding box from the warped
-        thermal image.
-
-        Parameters
-        ----------
-        warped_thermal : np.ndarray (rgb_h, rgb_w) from warp_thermal()
-        x1, y1, x2, y2 : int — bounding box in RGB pixel coords
-
-        Returns
-        -------
-        float or None — max temperature in the box region, ignoring NaN
-        """
+        """Query max temperature inside a bounding box from warped thermal."""
         if warped_thermal is None:
             return None
         region = warped_thermal[y1:y2, x1:x2]
@@ -175,38 +191,43 @@ class HomographyCalibrator:
         val = np.nanmax(region)
         return None if np.isnan(val) else float(val)
 
-    # ── Persistence ─────────────────────────────────────────────────────────
+    # ── Persistence ───────────────────────────────────────────────────────
 
     def save(self, path="homography/calibration.json"):
-        """Save correspondences and H to a JSON file."""
         data = {
             "pts_thermal": self.pts_thermal,
             "pts_rgb": self.pts_rgb,
             "thermal_shape": list(self.thermal_shape),
             "rgb_shape": list(self.rgb_shape),
+            "rotation_deg": self.rotation_deg,
+            "scale_factor": self.scale_factor,
+            "affine_samples": [a.tolist() for a in self._affine_samples],
         }
         if self.H is not None:
             data["H"] = self.H.tolist()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
-        print(f"[HomographyCalibrator] Saved to {path} ({len(self.pts_thermal)} points)")
+        print(f"[HomographyCalibrator] Saved to {path} "
+              f"(rotation={self.rotation_deg:.1f}°, {len(self._affine_samples)} frames)")
 
     def load(self, path="homography/calibration.json"):
-        """Load a previous calibration from disk."""
         with open(path) as f:
             data = json.load(f)
-        self.pts_thermal = data["pts_thermal"]
-        self.pts_rgb = data["pts_rgb"]
+        self.pts_thermal = data.get("pts_thermal", [])
+        self.pts_rgb = data.get("pts_rgb", [])
         self.thermal_shape = tuple(data["thermal_shape"])
         self.rgb_shape = tuple(data["rgb_shape"])
+        self.rotation_deg = data.get("rotation_deg", 0.0)
+        self.scale_factor = data.get("scale_factor", 1.0)
+        self._affine_samples = [np.array(a) for a in data.get("affine_samples", [])]
         if "H" in data:
             self.H = np.array(data["H"], dtype=np.float64)
             self.calibrated = True
-        print(f"[HomographyCalibrator] Loaded {len(self.pts_thermal)} points, "
-              f"calibrated={self.calibrated}")
+        print(f"[HomographyCalibrator] Loaded rotation={self.rotation_deg:.1f}°, "
+              f"{len(self._affine_samples)} frames, calibrated={self.calibrated}")
 
-    # ── Status ──────────────────────────────────────────────────────────────
+    # ── Status ────────────────────────────────────────────────────────────
 
     @property
     def num_points(self):
@@ -215,5 +236,5 @@ class HomographyCalibrator:
     @property
     def status_text(self):
         if self.calibrated:
-            return f"H calibrated ({self.num_points} pts)"
-        return f"Collecting {self.num_points}/{self.MIN_POINTS} pts"
+            return f"rot={self.rotation_deg:.0f} scale={self.scale_factor:.2f} ({len(self._affine_samples)}f)"
+        return f"Collecting {len(self._affine_samples)}/{self.MIN_FRAMES} frames"
